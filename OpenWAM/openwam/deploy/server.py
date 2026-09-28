@@ -119,6 +119,25 @@ def _normalize_compile_enabled_arg(value: str) -> bool:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+class PolicySession:
+    """One rollout client's action buffer and counters, sharing only the model engine."""
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.request_count = 0
+        self.total_latency = 0.0
+        self.initialized = False
+
+    def reset(self):
+        self.policy.reset()
+        self.request_count = 0
+        self.total_latency = 0.0
+        self.initialized = True
+
+    def shutdown(self):
+        self.policy.shutdown()
+
+
 class PolicyServer:
     """WebSocket policy server for WAM deployment.
 
@@ -127,9 +146,10 @@ class PolicyServer:
         cfg: Config with policy and server settings.
     """
 
-    def __init__(self, engine, cfg):
+    def __init__(self, engine, cfg, *, session_isolation: bool = False):
         self.engine = engine
         self.cfg = cfg
+        self.session_isolation = session_isolation
 
         # Lazy imports at init time to validate availability
         self._policy = None
@@ -145,6 +165,9 @@ class PolicyServer:
         from openwam.deploy.policy import WAMPolicy
 
         execution_config = resolve_execution_config(self.cfg)
+        if self.session_isolation and execution_config.enabled:
+            raise ValueError("Session isolation requires the synchronous executor")
+        self._execution_config = execution_config
         self._policy = WAMPolicy(
             engine=self.engine,
             cfg=self.cfg,
@@ -163,6 +186,15 @@ class PolicyServer:
             d.img_width,
         )
 
+    def new_session(self) -> PolicySession:
+        """Give each WebSocket its own policy buffer without loading another model."""
+        self._init_policy()
+        from openwam.deploy.policy import WAMPolicy
+
+        return PolicySession(WAMPolicy(
+            engine=self.engine, cfg=self.cfg, execution_config=self._execution_config,
+        ))
+
     def _ckpt_contract(self) -> dict:
         """Representation-contract fields advertised in the PONG for client-side validation.
 
@@ -177,7 +209,7 @@ class PolicyServer:
         contract = getattr(getattr(self.engine, "architecture", None), "repr_contract", None)
         return dict(contract) if contract else {}
 
-    def predict(self, obs: dict) -> dict:
+    def predict(self, obs: dict, *, session: Optional[PolicySession] = None) -> dict:
         """Synchronous prediction for a single observation.
 
         Args:
@@ -193,18 +225,26 @@ class PolicyServer:
             "step", "latency_ms".
         """
         self._init_policy()
+        if session is not None and not session.initialized:
+            raise ValueError("A new session must reset before its first observation")
         t0 = time.monotonic()
 
         obs = self._obs_preprocessor.preprocess(obs)
-        action = self._policy.predict_action(obs)
+        action = (session.policy if session is not None else self._policy).predict_action(obs)
 
         latency_ms = (time.monotonic() - t0) * 1000
-        self._request_count += 1
-        self._total_latency += latency_ms
+        if session is None:
+            self._request_count += 1
+            self._total_latency += latency_ms
+            step = self._request_count
+        else:
+            session.request_count += 1
+            session.total_latency += latency_ms
+            step = session.request_count
 
         return {
             "action": action.tolist(),
-            "step": self._request_count,
+            "step": step,
             "latency_ms": round(latency_ms, 2),
         }
 
@@ -237,6 +277,7 @@ class PolicyServer:
         async def ws_handler(websocket):
             """Handle WebSocket connections."""
             logger.info("Client connected: %s", websocket.remote_address)
+            session = self.new_session() if self.session_isolation else None
             try:
                 async for message in websocket:
                     try:
@@ -244,10 +285,13 @@ class PolicyServer:
                         msg_type = data.get("type", OBS)
 
                         if msg_type == RESET:
-                            self.reset()
+                            if session is None:
+                                self.reset()
+                            else:
+                                session.reset()
                             await websocket.send(json.dumps({"type": RESET_ACK}))
                         elif msg_type == OBS:
-                            result = self.predict(data)
+                            result = self.predict(data, session=session)
                             result["type"] = ACTION
                             await websocket.send(json.dumps(result))
                         elif msg_type == PING:
@@ -288,6 +332,9 @@ class PolicyServer:
                         )
             except websockets.exceptions.ConnectionClosed:
                 logger.info("Client disconnected")
+            finally:
+                if session is not None:
+                    session.shutdown()
 
         async def serve():
             # ping_interval=None: slow inference (notably torch.compile warmup on
@@ -457,6 +504,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", type=str, default=None, help="WebSocket bind host override.")
     parser.add_argument("--port", type=int, default=None, help="WebSocket port override.")
+    parser.add_argument(
+        "--session-isolation", action="store_true",
+        help="Isolate each WebSocket's action buffer and RESET while sharing one model.",
+    )
     parser.add_argument(
         "--denoise-steps",
         type=int,
@@ -664,6 +715,7 @@ def main(argv: Optional[list[str]] = None):
         device=device,
         ckpt_name=args.ckpt_name,
     )
+    server.session_isolation = args.session_isolation
     logging.getLogger("deploy").info(
         "Inference engine ready — steps=%d denoise_mode=%s",
         OmegaConf.select(server.cfg, "inference.denoise_steps", default=20),
