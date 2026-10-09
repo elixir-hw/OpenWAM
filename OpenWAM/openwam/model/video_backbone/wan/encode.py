@@ -40,8 +40,9 @@ def encode_text_for_inference(
     """Deploy ``(context, seq_lens)``, reusing a prompt-keyed cached embed."""
     if vace_cache and vace_cache.get("populated") and vace_cache.get("prompt_key") == prompt:
         return vace_cache["context"], vace_cache["seq_lens"]
-    if prompt_embed_cache is not None and prompt in prompt_embed_cache:
-        return prompt_embed_cache[prompt]
+    cached = prompt_embed_cache.get(prompt) if prompt_embed_cache is not None else None
+    if cached is not None:
+        return cached
     context, seq_lens = encode_text([prompt], tokenizer=tokenizer, text_encoder=text_encoder, device=device)
     if prompt_embed_cache is not None:
         prompt_embed_cache[prompt] = (context, seq_lens)

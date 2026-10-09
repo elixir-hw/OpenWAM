@@ -1,0 +1,55 @@
+{
+  "label": "openwam-robotwin-wm-vs-no-wm-10x32",
+  "smoke_only": false,
+  "paths": {
+    "openwam_repo": "${OPENWAM_REPO}",
+    "robotwin_repo": "${ROBOTWIN_REPO}",
+    "robotwin_python": "${ROBOTWIN_PYTHON}",
+    "robotwin_task_config_dir": "${ROBOTWIN_TASK_CONFIG_DIR}",
+    "robotwin_assets_dir": "${ROBOTWIN_ASSETS_DIR}",
+    "state_manifest_root": "manifests/selected10_10_states",
+    "task_file": "tasks/selected10.txt"
+  },
+  "protocol": {
+    "mode": "demo_clean",
+    "states_per_task": 10,
+    "rollouts_per_state": 32,
+    "seed": 0,
+    "instruction_type": "unseen",
+    "checkpoint_name": "checkpoint_step_50000.safetensors",
+    "skip_get_obs_within_replan": false,
+    "max_manifest_attempts": 1000,
+    "max_consecutive_infra_errors": 3
+  },
+  "runtimes": {
+    "openwam": {
+      "conda_env": "openwam"
+    }
+  },
+  "hardware": {
+    "openwam_model_gpu": 0,
+    "openwam_sim_gpu": 0,
+    "text_cache_gpu": 0,
+    "parallel_gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+    "workers_per_gpu": 1,
+    "parallel_by_rollout": true,
+    "openwam_host": "127.0.0.1",
+    "openwam_port": 8848,
+    "persistent_server": true,
+    "shared_server_sessions": true,
+    "persistent_servers_per_gpu": 1,
+    "persistent_clients_per_gpu": 8
+  },
+  "models": {
+    "openwam": {
+      "no_wm": {
+        "checkpoint_dir": "${NO_WM_CHECKPOINT_DIR}",
+        "deploy_args": ["--compile-enabled", "false"]
+      },
+      "wm": {
+        "checkpoint_dir": "${WM_CHECKPOINT_DIR}",
+        "deploy_args": ["--compile-enabled", "false"]
+      }
+    }
+  }
+}

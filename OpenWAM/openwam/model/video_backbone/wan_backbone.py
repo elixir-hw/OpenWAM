@@ -936,14 +936,34 @@ class WanBase(VideoBackbone):
             time_division_remainder=self._time_division_remainder,
         )
 
-        context, seq_lens = wan_encode.encode_text_for_inference(
-            prompt,
-            vace_cache=vace_cache,
-            prompt_embed_cache=prompt_embed_cache,
-            tokenizer=self._tokenizer,
-            text_encoder=self.text_encoder,
-            device=self.device,
-        )
+        if self._text_embedding_cache is not None:
+            context, seq_lens = self._text_embedding_cache.load_batch(
+                [prompt], device=self.device, dtype=self.dtype
+            )
+            if prompt_embed_cache is not None:
+                prompt_embed_cache[prompt] = (context, seq_lens)
+            if not self._logged_cached_text_embeddings:
+                logger.info(
+                    "Using cached text embeddings for inference; skipping Wan T5 encode: %s",
+                    self._text_embedding_cache.cache_dir,
+                )
+                self._logged_cached_text_embeddings = True
+        else:
+            text_encoder = getattr(self, "text_encoder", None)
+            if text_encoder is None:
+                raise RuntimeError(
+                    "Wan text_encoder is not loaded and no text embedding cache is configured. "
+                    "Set training.use_cached_text_embeddings=true with training.text_embedding_cache_dir, "
+                    "or set model.video_backbone.load_text_encoder=true."
+                )
+            context, seq_lens = wan_encode.encode_text_for_inference(
+                prompt,
+                vace_cache=vace_cache,
+                prompt_embed_cache=prompt_embed_cache,
+                tokenizer=self._tokenizer,
+                text_encoder=text_encoder,
+                device=self.device,
+            )
 
         _DEFAULT_CAMERA_ORIGIN = (
             0,

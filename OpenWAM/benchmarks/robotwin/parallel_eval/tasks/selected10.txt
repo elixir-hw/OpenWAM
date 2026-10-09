@@ -1,0 +1,10 @@
+place_fan
+place_a2b_right
+put_bottles_dustbin
+place_mouse_pad
+place_dual_shoes
+pick_diverse_bottles
+rotate_qrcode
+open_laptop
+beat_block_hammer
+stack_blocks_three

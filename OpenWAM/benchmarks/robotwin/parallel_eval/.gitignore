@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+config.local*.json
+manifests/
+result/
+runs/
+*.log

@@ -619,9 +619,8 @@ class Cosmos3EdgeVideoBackbone(VideoBackbone):
             # the cache key must carry it — a bare-prompt key would silently
             # reuse stale conditioning across resolutions/durations.
             cache_key = (str(prompt), num_frames, height, width, fps)
-            if prompt_embed_cache is not None and cache_key in prompt_embed_cache:
-                enc = prompt_embed_cache[cache_key]
-            else:
+            enc = prompt_embed_cache.get(cache_key) if prompt_embed_cache is not None else None
+            if enc is None:
                 enc = self._encode_prompts([str(prompt)], num_frames=num_frames, height=height, width=width, fps=fps)
                 if prompt_embed_cache is not None:
                     prompt_embed_cache[cache_key] = enc

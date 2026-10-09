@@ -209,6 +209,7 @@ class ModelClient:
         self._debug_dir = debug_dir
         self._episode = -1  # incremented to 0 on the first reset_model() call
         self._step = 0
+        self._sampling_seed: Optional[int] = None
 
         self._ws_url = f"ws://{host}:{port}"
         self._client = WSPolicyClient(self._ws_url, timeout=request_timeout)
@@ -257,6 +258,10 @@ class ModelClient:
         result = self._client.reset()
         if result.get("type") != transport.RESET_ACK:
             raise RuntimeError(f"[OpenWAMClient] Server reset failed: {result}")
+
+    def set_sampling_seed(self, seed: int) -> None:
+        self._sampling_seed = int(seed)
+        self._step = 0
 
     def _save_debug_step(
         self,
@@ -348,6 +353,8 @@ class ModelClient:
             prompt=prompt,
             state=state_list,
         )
+        if self._sampling_seed is not None:
+            payload["seed"] = self._sampling_seed * 10000 + self._step
         response = self._client.predict(payload)
         action = np.array(response["action"], dtype=np.float32)
 

@@ -588,6 +588,24 @@ class TestJointEngineCompileFlags:
         engine, _ = self._make_engine(prompt_cache_cfg={"enabled": False, "maxsize": 8})
         assert engine._prompt_embed_cache is None
 
+    def test_prompt_embed_cache_is_safe_under_concurrent_lru_eviction(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from openwam.deploy.engine import _BoundedPromptEmbedCache
+
+        cache = _BoundedPromptEmbedCache(maxsize=8)
+
+        def hammer(worker: int) -> None:
+            for index in range(2000):
+                key = f"prompt-{(worker + index) % 64}"
+                cache[key] = (worker, index)
+                cache.get(key)
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            list(executor.map(hammer, range(32)))
+
+        assert len(cache) <= 8
+
     def test_generate_kwarg_filter_treats_disabled_cache_drop_as_noop(self, caplog):
         class _StrictArchitecture:
             def generate(self, *, schedule, prompt):

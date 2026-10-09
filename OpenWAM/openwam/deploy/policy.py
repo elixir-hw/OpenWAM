@@ -99,4 +99,6 @@ class WAMPolicy:
             conditions["prompt"] = obs["prompt"]
         if "state" in obs and obs["state"] is not None:
             conditions["proprio"] = obs["state"]
+        if "seed" in obs and obs["seed"] is not None:
+            conditions["seed"] = int(obs["seed"])
         return conditions

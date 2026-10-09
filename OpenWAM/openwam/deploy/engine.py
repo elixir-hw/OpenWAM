@@ -11,6 +11,7 @@ VACE context). The actual denoising loop lives on the model side
 import inspect
 import logging
 import os
+import threading
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Any, Optional
@@ -61,27 +62,52 @@ class BaseInferenceEngine(ABC):
 
 
 class _BoundedPromptEmbedCache(OrderedDict):
-    """LRU-bounded dict for ``prompt -> inputs_posi``."""
+    """Thread-safe LRU-bounded dict for ``prompt -> inputs_posi``.
+
+    Policy servers may process several client sessions concurrently.  LRU
+    updates and eviction therefore have to be one atomic operation; otherwise
+    one request can evict a key after another request's membership check but
+    before its ``move_to_end`` call.
+    """
 
     def __init__(self, maxsize: int = DEFAULT_PROMPT_EMBED_CACHE_MAXSIZE):
+        self._lock = threading.RLock()
         super().__init__()
         self._maxsize = max(1, int(maxsize))
         self._evict_warned = False
 
     def __getitem__(self, key: Any) -> Any:
-        value = super().__getitem__(key)
-        self.move_to_end(key)
-        return value
+        with self._lock:
+            value = super().__getitem__(key)
+            super().move_to_end(key)
+            return value
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        """Return and touch ``key`` without a racy contains/get sequence."""
+        with self._lock:
+            try:
+                value = super().__getitem__(key)
+            except KeyError:
+                return default
+            super().move_to_end(key)
+            return value
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        while len(self) > self._maxsize:
-            evicted_key, _ = self.popitem(last=False)
-            if not self._evict_warned:
-                self._evict_warned = True
-                logger.warning("prompt_embed_cache exceeded maxsize=%d; evicted %r", self._maxsize, evicted_key)
+        with self._lock:
+            if super().__contains__(key):
+                super().move_to_end(key)
+            super().__setitem__(key, value)
+            while super().__len__() > self._maxsize:
+                # ``OrderedDict.popitem`` fetches the value through the
+                # subclass' ``__getitem__`` before deleting it.  Our read
+                # deliberately touches the LRU order, so invoking popitem
+                # here would move the key that popitem is about to remove.
+                # Delete the oldest key directly while holding the lock.
+                evicted_key = next(iter(self))
+                OrderedDict.__delitem__(self, evicted_key)
+                if not self._evict_warned:
+                    self._evict_warned = True
+                    logger.warning("prompt_embed_cache exceeded maxsize=%d; evicted %r", self._maxsize, evicted_key)
 
 
 class JointInferenceEngine(BaseInferenceEngine):

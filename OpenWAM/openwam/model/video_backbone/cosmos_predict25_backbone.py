@@ -731,12 +731,13 @@ class CosmosPredict25VideoBackbone(VideoBackbone):
 
     def _build_uncond_context(self, *, context_template: Tensor, prompt_embed_cache: Optional[dict] = None) -> Tensor:
         """Materialise the unconditional text context for CFG via ``text_encoder("")``."""
-        if prompt_embed_cache is not None and "" in prompt_embed_cache:
-            ctx = prompt_embed_cache[""].to(device=context_template.device, dtype=context_template.dtype)
-        else:
+        ctx = prompt_embed_cache.get("") if prompt_embed_cache is not None else None
+        if ctx is None:
             ctx = self._encode_text_context("", device=context_template.device, dtype=context_template.dtype)
             if prompt_embed_cache is not None:
                 prompt_embed_cache[""] = ctx
+        else:
+            ctx = ctx.to(device=context_template.device, dtype=context_template.dtype)
         if ctx.shape[0] == 1 and context_template.shape[0] > 1:
             ctx = ctx.expand(context_template.shape[0], -1, -1).contiguous()
         if ctx.shape != context_template.shape:
