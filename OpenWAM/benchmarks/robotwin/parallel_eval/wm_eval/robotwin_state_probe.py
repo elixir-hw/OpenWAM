@@ -397,15 +397,18 @@ def run_one_rollout(
         "terminal_step": None,
         "truncated": False,
         "error": None,
+        "error_phase": None,
         "elapsed_sec": None,
         "timing": {"setup_sec": 0.0, "get_obs_sec": 0.0, "eval_sec": 0.0,
                    "teardown_sec": 0.0, "obs_count": 0, "action_steps": 0},
     }
+    phase = "reset"
     try:
         phase_start = time.monotonic()
         reset_func(model)
         if hasattr(model, "set_sampling_seed"):
             model.set_sampling_seed(policy_seed)
+        phase = "setup"
         task_env.setup_demo(
             now_ep_num=int(state["now_ep_num"]),
             seed=int(state["accepted_seed"]),
@@ -415,13 +418,22 @@ def run_one_rollout(
         restore_task_runtime_state(task_env)
         task_env.set_instruction(instruction=str(state["instruction"]))
         result["timing"]["setup_sec"] = round(time.monotonic() - phase_start, 3)
+        phase = "rollout"
         action_limit = min(task_env.step_lim, max_action_steps) if max_action_steps else task_env.step_lim
         while task_env.take_action_cnt < action_limit:
             need_obs = True
             if skip_get_obs_within_replan and hasattr(model, "should_request_observation"):
                 need_obs = bool(model.should_request_observation())
             phase_start = time.monotonic()
-            observation = task_env.get_obs() if need_obs else None
+            if need_obs:
+                observation = task_env.get_obs()
+            else:
+                observation = None
+                # get_obs() also advances RoboTwin's per-step random lighting.
+                # Preserve that state for the rare crazy-light scenes without
+                # capturing camera images or sending a model request.
+                if getattr(task_env, "crazy_random_light", False):
+                    task_env._update_render()
             result["timing"]["get_obs_sec"] += time.monotonic() - phase_start
             result["timing"]["obs_count"] += int(need_obs)
             phase_start = time.monotonic()
@@ -437,6 +449,7 @@ def run_one_rollout(
         )
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+        result["error_phase"] = phase
         traceback.print_exc()
     finally:
         phase_start = time.monotonic()
@@ -525,9 +538,189 @@ def run_state_rollouts(module, usr_args: dict[str, Any], args: argparse.Namespac
         )
 
 
+def run_interleaved_task(module, usr_args: dict[str, Any], args: argparse.Namespace) -> None:
+    """Match RoboTwin's expert-check loop inside one persistent client worker."""
+    task_env, env_args, _video_size = prepare_task(module, usr_args)
+    policy_name = env_args["policy_name"]
+    get_model = module.eval_function_decorator(policy_name, "get_model")
+    eval_func = module.eval_function_decorator(policy_name, "eval")
+    reset_func = module.eval_function_decorator(policy_name, "reset_model")
+    model = get_model(usr_args)
+    task_root = args.result_file.parent
+    start_seed = 100000 * (1 + int(args.seed))
+    next_seed = start_seed
+    accepted = 0
+    attempts = 0
+    successes = 0
+    consecutive_infra_errors = 0
+    started_at = time.monotonic()
+
+    # Completed states are the commit log. A crash after writing a state result
+    # but before updating progress therefore resumes without counting it twice.
+    for state_id in range(args.num_states):
+        result_path = task_root / f"state_{state_id:03d}" / "result.json"
+        if not result_path.is_file():
+            break
+        result = load_json(result_path)
+        if (
+            result.get("task") != args.task
+            or result.get("mode") != args.mode
+            or result.get("method") != args.method
+            or result.get("checkpoint_dir") != args.checkpoint_dir
+            or int(result.get("state_id", -1)) != state_id
+            or result.get("expert_check") != {"plan_success": True, "check_success": True}
+            or int(result.get("valid_rollouts", 0)) != 1
+            or int(result.get("infra_failures", 1)) != 0
+            or len(result.get("rollouts", [])) != 1
+            or result["rollouts"][0].get("error")
+        ):
+            raise ValueError(f"Invalid completed state: {result_path}")
+        accepted += 1
+        successes += int(bool(result["rollouts"][0]["success"]))
+        next_seed = int(result["next_seed"])
+        attempts = int(result["candidate_attempts"])
+    if args.progress_file and args.progress_file.is_file():
+        progress = load_json(args.progress_file)
+        if int(progress.get("accepted_states", -1)) == accepted:
+            next_seed = max(next_seed, int(progress.get("next_seed", next_seed)))
+            attempts = max(attempts, int(progress.get("attempts", attempts)))
+
+    def save_progress() -> None:
+        if args.progress_file:
+            write_json(args.progress_file, {
+                "operation": "run_interleaved_task",
+                "task": args.task,
+                "mode": args.mode,
+                "requested_states": args.num_states,
+                "accepted_states": accepted,
+                "successes": successes,
+                "attempts": attempts,
+                "next_seed": next_seed,
+            })
+
+    save_progress()
+    while accepted < args.num_states:
+        if attempts >= args.max_manifest_attempts:
+            raise RuntimeError(
+                f"Only {accepted}/{args.num_states} expert-solvable states after "
+                f"{attempts} candidates for {args.task}"
+            )
+        candidate_seed = next_seed
+        attempts += 1
+        try:
+            task_env.setup_demo(now_ep_num=accepted, seed=candidate_seed, is_test=True, **env_args)
+            episode_info = task_env.play_once()
+            expert_passed = bool(task_env.plan_success and task_env.check_success())
+            consecutive_infra_errors = 0
+        except module.UnStableError:
+            expert_passed = False
+        except Exception as exc:
+            expert_passed = False
+            # These three RoboTwin expert failures were observed on particular
+            # candidate scenes in the paused Clean50 run. They never pass the
+            # official expert solvability gate and therefore cannot enter the
+            # 100-state denominator. Advance the seed as for UnStableError.
+            frames = traceback.extract_tb(exc.__traceback__)
+            known_unsolvable = (
+                args.task in {"open_microwave", "place_container_plate", "put_bottles_dustbin"}
+                and isinstance(exc, AssertionError)
+                and str(exc) == "target_pose cannot be None for move action."
+                and any(frame.name == "grasp_actor" for frame in frames)
+            ) or (
+                args.task == "put_bottles_dustbin"
+                and isinstance(exc, IndexError)
+                and any(frame.name == "play_once" and frame.filename.endswith(
+                    "/envs/put_bottles_dustbin.py") for frame in frames)
+            )
+            if known_unsolvable:
+                consecutive_infra_errors = 0
+                print(f"[state_probe] expert rejected candidate seed={candidate_seed}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+            else:
+                consecutive_infra_errors += 1
+                print(f"[state_probe] expert candidate failed seed={candidate_seed}: "
+                      f"{type(exc).__name__}: {exc}", flush=True)
+                if consecutive_infra_errors >= args.max_consecutive_infra_errors:
+                    raise RuntimeError(
+                        f"{consecutive_infra_errors} consecutive expert infrastructure errors "
+                        f"for {args.task}; see task log"
+                    ) from exc
+        finally:
+            safe_close(task_env)
+        if not expert_passed:
+            next_seed += 1
+            save_progress()
+            continue
+
+        descriptions = module.generate_episode_descriptions(
+            args.task, [episode_info["info"]], args.num_states
+        )
+        candidates = descriptions[0][args.instruction_type]
+        if not candidates:
+            raise ValueError(f"No {args.instruction_type} instruction for {args.task}")
+        instruction = str(np.random.choice(candidates))
+        state = {"state_id": accepted, "accepted_seed": candidate_seed,
+                 "now_ep_num": accepted, "instruction": instruction}
+        policy_seed = int(args.policy_seed_base + accepted * 1000)
+        rollout = run_one_rollout(
+            module, task_env, env_args, model, eval_func, reset_func, state,
+            0, policy_seed, bool(usr_args.get("skip_get_obs_within_replan", False)),
+            args.max_action_steps,
+        )
+        if rollout["error"]:
+            if rollout.get("error_phase") == "setup":
+                # RoboTwin discards a seed when policy-scene initialization fails.
+                next_seed += 1
+                consecutive_infra_errors += 1
+                if consecutive_infra_errors >= args.max_consecutive_infra_errors:
+                    raise RuntimeError(
+                        f"{consecutive_infra_errors} consecutive policy-scene setup errors "
+                        f"for {args.task}: {rollout['error']}"
+                    )
+                save_progress()
+                continue
+            raise RuntimeError(
+                f"Policy rollout failed for {args.task} accepted state {accepted} "
+                f"seed={candidate_seed}: {rollout['error']}"
+            )
+        consecutive_infra_errors = 0
+        result = {
+            "task": args.task,
+            "mode": args.mode,
+            "state_id": accepted,
+            "accepted_seed": candidate_seed,
+            "instruction": instruction,
+            "method": args.method,
+            "checkpoint_dir": args.checkpoint_dir,
+            "manifest_hash": None,
+            "expert_check": {"plan_success": True, "check_success": True},
+            "candidate_attempts": attempts,
+            "next_seed": candidate_seed + 1,
+            "num_rollouts": 1,
+            "successes": int(bool(rollout["success"])),
+            "valid_rollouts": 1,
+            "infra_failures": 0,
+            "rollouts": [rollout],
+        }
+        write_json(task_root / f"state_{accepted:03d}" / "result.json", result)
+        accepted += 1
+        successes += int(bool(rollout["success"]))
+        next_seed += 1
+        save_progress()
+        print(f"[state_probe] {args.mode}/{args.task}: {accepted}/{args.num_states} "
+              f"accepted, success={successes}, candidates={attempts}", flush=True)
+
+    write_json(args.result_file, {
+        "task": args.task, "mode": args.mode, "accepted_states": accepted,
+        "successes": successes, "attempts": attempts,
+        "wall_sec": round(time.monotonic() - started_at, 3),
+        "expert_check": True, "interleaved": True,
+    })
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--operation", choices=("build_state_manifest", "run_state_rollouts"), required=True)
+    parser.add_argument("--operation", choices=("build_state_manifest", "run_state_rollouts", "run_interleaved_task"), required=True)
     parser.add_argument("--openwam-wrapper", type=Path, required=True)
     parser.add_argument("--policy-config", type=Path, required=True)
     parser.add_argument("--task", required=True)
@@ -566,6 +759,8 @@ def main() -> int:
         if args.state_manifest is None:
             raise ValueError("--state-manifest is required for run_state_rollouts")
         run_state_rollouts(module, usr_args, args)
+    elif args.operation == "run_interleaved_task":
+        run_interleaved_task(module, usr_args, args)
     return 0
 
 

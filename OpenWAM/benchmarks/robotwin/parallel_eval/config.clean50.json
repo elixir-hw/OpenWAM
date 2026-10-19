@@ -1,0 +1,68 @@
+{
+  "label": "openwam-clean50-50000step-clean",
+  "smoke_only": false,
+  "paths": {
+    "openwam_repo": "../../..",
+    "robotwin_repo": "REPLACE_ME",
+    "robotwin_python": "REPLACE_ME",
+    "robotwin_task_config_dir": "REPLACE_ME",
+    "robotwin_assets_dir": "REPLACE_ME",
+    "state_manifest_root": "manifests",
+    "task_file": "tasks/all_50.txt",
+    "allowed_task_file": "tasks/all_50.txt"
+  },
+  "protocol": {
+    "mode": "demo_clean",
+    "states_per_task": 100,
+    "rollouts_per_state": 1,
+    "interleaved_expert_check": true,
+    "seed": 0,
+    "instruction_type": "unseen",
+    "checkpoint_name": "checkpoint_step_50000.safetensors",
+    "skip_get_obs_within_replan": true,
+    "max_manifest_attempts": 5000,
+    "max_consecutive_infra_errors": 3
+  },
+  "runtimes": {
+    "openwam": {
+      "command": [
+        "python"
+      ]
+    }
+  },
+  "hardware": {
+    "openwam_model_gpu": 0,
+    "openwam_sim_gpu": 0,
+    "text_cache_gpu": 0,
+    "parallel_gpus": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "workers_per_gpu": 1,
+    "parallel_by_rollout": true,
+    "openwam_host": "127.0.0.1",
+    "openwam_port": 8950,
+    "persistent_server": true,
+    "shared_server_sessions": true,
+    "persistent_servers_per_gpu": 1,
+    "persistent_clients_per_gpu": 6,
+    "manifest_parallel_workers": 4
+  },
+  "models": {
+    "openwam": {
+      "wm": {
+        "checkpoint_dir": "REPLACE_ME",
+        "deploy_args": [
+          "--compile-enabled",
+          "false"
+        ]
+      }
+    }
+  }
+}

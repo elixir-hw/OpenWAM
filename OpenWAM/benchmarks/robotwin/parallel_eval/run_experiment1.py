@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import csv
+import hashlib
 import json
 import math
 import os
@@ -54,6 +56,15 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def local_runtime_root(run_root: Path, *parts: str) -> Path:
+    """Keep RoboTwin's symlink-based scratch tree off OSS-backed result mounts."""
+    base = Path(os.environ.get("ROBOTWIN_EVAL_RUNTIME_DIR", "/tmp/openwam_robotwin_eval"))
+    run_id = hashlib.sha256(str(run_root.resolve()).encode()).hexdigest()[:16]
+    runtime = base / run_id / Path(*parts)
+    runtime.mkdir(parents=True, exist_ok=True)
+    return runtime
+
+
 def selected_tasks(config: dict[str, Any], task_limit: int | None = None) -> list[str]:
     tasks = load_tasks(Path(config["paths"]["task_file"]))
     return tasks[:task_limit] if task_limit else tasks
@@ -62,7 +73,8 @@ def selected_tasks(config: dict[str, Any], task_limit: int | None = None) -> lis
 def validate(config: dict[str, Any]) -> None:
     errors: list[str] = []
     tasks = selected_tasks(config)
-    seen = set(load_tasks(TASK_DIR / "seen_40.txt"))
+    allowed_task_file = Path(config["paths"].get("allowed_task_file") or TASK_DIR / "seen_40.txt")
+    seen = set(load_tasks(allowed_task_file))
     if not tasks:
         errors.append("paths.task_file must contain at least one task")
     duplicates = sorted({task for task in tasks if tasks.count(task) > 1})
@@ -70,7 +82,7 @@ def validate(config: dict[str, Any]) -> None:
         errors.append(f"duplicate tasks: {duplicates}")
     not_seen = sorted(set(tasks) - seen)
     if not_seen:
-        errors.append(f"Experiment 1 tasks must be from seen_40.txt, got non-seen tasks: {not_seen}")
+        errors.append(f"Tasks absent from {allowed_task_file}: {not_seen}")
 
     openwam_repo = Path(config["paths"]["openwam_repo"])
     robotwin_repo = Path(config["paths"]["robotwin_repo"])
@@ -123,6 +135,11 @@ def validate(config: dict[str, Any]) -> None:
         errors.append(f"hardware.parallel_gpus must contain non-negative GPU indices, got {parallel_gpus}")
     if int(config["hardware"].get("workers_per_gpu", 1)) < 1:
         errors.append("hardware.workers_per_gpu must be positive")
+    manifest_workers = int(config["hardware"].get("manifest_parallel_workers", 1))
+    if manifest_workers < 1:
+        errors.append("hardware.manifest_parallel_workers must be positive")
+    if parallel_gpus and manifest_workers > len(parallel_gpus):
+        errors.append("hardware.manifest_parallel_workers exceeds available parallel_gpus")
     if config["hardware"].get("persistent_server"):
         if not parallel_gpus or not config["hardware"].get("parallel_by_rollout"):
             errors.append("persistent_server requires parallel_gpus and parallel_by_rollout")
@@ -139,6 +156,13 @@ def validate(config: dict[str, Any]) -> None:
             errors.append("multiple persistent clients require shared_server_sessions=true")
         if clients > 1 and int(config["hardware"].get("persistent_servers_per_gpu", 1)) != 1:
             errors.append("shared clients require one persistent model server per GPU")
+    if config["protocol"].get("interleaved_expert_check"):
+        if not config["hardware"].get("persistent_server"):
+            errors.append("interleaved expert check requires persistent_server=true")
+        if int(config["protocol"].get("rollouts_per_state", 0)) != 1:
+            errors.append("interleaved expert check requires one rollout per accepted state")
+        if int(config["hardware"].get("persistent_servers_per_gpu", 1)) != 1:
+            errors.append("interleaved expert check requires one model server per GPU")
 
     if errors:
         raise ValueError("Invalid Experiment 1 configuration:\n- " + "\n- ".join(errors))
@@ -164,7 +188,9 @@ def make_env(config: dict[str, Any], *, sim_gpu: bool) -> dict[str, str]:
     robotwin_repo = Path(config["paths"]["robotwin_repo"])
     env["PYTHONUNBUFFERED"] = "1"
     env["ROBOTWIN_PATH"] = str(robotwin_repo)
-    env.setdefault("ROBOTWIN_ENABLE_PLANNER_FALLBACK", "1")
+    # Keep the official expert feasibility check on its normal planner path,
+    # even when the caller's shell enables the compatibility fallback.
+    env["ROBOTWIN_ENABLE_PLANNER_FALLBACK"] = "0"
     env.setdefault("MPLCONFIGDIR", str(ROOT / "runs" / ".matplotlib"))
     if config["paths"].get("robotwin_task_config_dir"):
         env["ROBOTWIN_TASK_CONFIG_DIR"] = str(config["paths"]["robotwin_task_config_dir"])
@@ -277,9 +303,8 @@ def ensure_manifests(
     force: bool,
 ) -> Path:
     manifest_root = Path(config["paths"]["state_manifest_root"]).resolve()
-    env = make_env(config, sim_gpu=True)
     openwam_repo = Path(config["paths"]["openwam_repo"])
-
+    pending: list[str] = []
     for task in tasks:
         task_dir = manifest_root / task / config["protocol"]["mode"]
         manifest_path = task_dir / "manifest.json"
@@ -292,29 +317,58 @@ def ensure_manifests(
             ):
                 print(f"[experiment1] reuse state manifest: {task}", flush=True)
                 continue
+        pending.append(task)
 
-        command_env = env.copy()
-        command_env["ROBOTWIN_RUNTIME_ROOT"] = str(task_dir / "runtime")
-        command = probe_command(
-            config,
-            operation="build_state_manifest",
-            task=task,
-            result_file=manifest_path,
-            progress_file=task_dir / "progress.json",
-            num_states=states_per_task,
-        )
-        run_logged(
-            command,
-            cwd=openwam_repo,
-            env=command_env,
-            log_path=run_root / "manifests" / f"{task}.log",
-            dry_run=dry_run,
-            quiet=True,
-        )
+    parallel_gpus = [int(gpu) for gpu in config["hardware"].get("parallel_gpus", [])]
+    if not parallel_gpus:
+        parallel_gpus = [int(config["hardware"]["openwam_sim_gpu"])]
+    worker_count = min(int(config["hardware"].get("manifest_parallel_workers", 1)), len(parallel_gpus))
+    task_queue = deque(pending)
+    queue_lock = threading.Lock()
+    print(f"[experiment1] pending manifests {len(pending)}/{len(tasks)} "
+          f"across {worker_count} GPU worker(s)", flush=True)
+
+    def build_on_gpu(gpu: int) -> None:
+        worker_config = deepcopy(config)
+        worker_config["hardware"]["openwam_sim_gpu"] = gpu
+        env = make_env(worker_config, sim_gpu=True)
+        while True:
+            with queue_lock:
+                if not task_queue:
+                    return
+                task = task_queue.popleft()
+            task_dir = manifest_root / task / config["protocol"]["mode"]
+            command_env = env.copy()
+            command_env["ROBOTWIN_RUNTIME_ROOT"] = str(
+                local_runtime_root(run_root, "manifests", task, config["protocol"]["mode"])
+            )
+            command = probe_command(
+                worker_config,
+                operation="build_state_manifest",
+                task=task,
+                result_file=task_dir / "manifest.json",
+                progress_file=task_dir / "progress.json",
+                num_states=states_per_task,
+            )
+            print(f"[experiment1] manifest {task} gpu={gpu}", flush=True)
+            run_logged(
+                command,
+                cwd=openwam_repo,
+                env=command_env,
+                log_path=run_root / "manifests" / f"{task}.log",
+                dry_run=dry_run,
+                quiet=True,
+            )
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(build_on_gpu, gpu)
+                   for gpu in parallel_gpus[:worker_count]]
+        for future in as_completed(futures):
+            future.result()
     return manifest_root
 
 
-def wait_for_port(host: str, port: int, process: subprocess.Popen[str], timeout: int = 300) -> None:
+def wait_for_port(host: str, port: int, process: subprocess.Popen[str], timeout: int = 900) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -462,7 +516,9 @@ def run_methods(
                 for state_id in range(state_count):
                     raw_dir = run_root / "openwam" / method / "raw" / task / f"state_{state_id:03d}"
                     command_env = client_env.copy()
-                    command_env["ROBOTWIN_RUNTIME_ROOT"] = str(raw_dir / "runtime")
+                    command_env["ROBOTWIN_RUNTIME_ROOT"] = str(
+                        local_runtime_root(run_root, method, task, f"state_{state_id:03d}")
+                    )
                     command = probe_command(
                         config,
                         operation="run_state_rollouts",
@@ -570,7 +626,10 @@ def run_parallel_methods(
             process, log = start_server(worker_config, method, model, run_root, dry_run, server_dir=worker_dir)
             try:
                 client_env = make_env(worker_config, sim_gpu=True)
-                client_env["ROBOTWIN_RUNTIME_ROOT"] = str(worker_dir / "runtime")
+                client_env["ROBOTWIN_RUNTIME_ROOT"] = str(
+                    local_runtime_root(run_root, method, task, f"state_{state_id:03d}",
+                                       f"rollout_{rollout_id:03d}" if rollout_id is not None else "combined")
+                )
                 command = probe_command(
                     worker_config,
                     operation="run_state_rollouts",
@@ -728,7 +787,10 @@ def run_persistent_methods(
                 raw_dir = run_root / "openwam" / method / "raw" / task / f"state_{state_id:03d}"
                 rollout_dir = raw_dir / f"rollout_{rollout_id:03d}"
                 client_env = make_env(worker_config, sim_gpu=True)
-                client_env["ROBOTWIN_RUNTIME_ROOT"] = str(rollout_dir / "runtime")
+                client_env["ROBOTWIN_RUNTIME_ROOT"] = str(
+                    local_runtime_root(run_root, method, task, f"state_{state_id:03d}",
+                                       f"rollout_{rollout_id:03d}")
+                )
                 command = probe_command(
                     worker_config, operation="run_state_rollouts", task=task,
                     result_file=rollout_dir / "result.json",
@@ -813,6 +875,152 @@ def run_persistent_methods(
         merge_rollout_results(run_root, tasks, methods, states_per_task, rollouts_per_state)
 
 
+def run_interleaved_methods(
+    config: dict[str, Any], run_root: Path, *, tasks: list[str], methods: list[str],
+    states_per_task: int, max_action_steps: int | None, dry_run: bool,
+) -> None:
+    """Each client checks a candidate with the expert, then tests the model."""
+    gpus = [int(gpu) for gpu in config["hardware"]["parallel_gpus"]]
+    clients_per_gpu = int(config["hardware"]["persistent_clients_per_gpu"])
+    task_lock = threading.Lock()
+    host = str(config["hardware"]["openwam_host"])
+    base_port = int(config["hardware"]["openwam_port"])
+    external_port_base = os.environ.get("OPENWAM_EXTERNAL_SERVER_PORT_BASE")
+    openwam_repo = Path(config["paths"]["openwam_repo"])
+
+    def complete_task(method: str, task: str) -> bool:
+        task_root = run_root / "openwam" / method / "raw" / task
+        summary_path = task_root / "task_summary.json"
+        if not summary_path.is_file():
+            return False
+        try:
+            summary = load_json(summary_path)
+            return (
+                summary.get("task") == task
+                and summary.get("mode") == config["protocol"]["mode"]
+                and summary.get("interleaved") is True
+                and int(summary.get("accepted_states", 0)) == states_per_task
+                and all((task_root / f"state_{state_id:03d}" / "result.json").is_file()
+                        for state_id in range(states_per_task))
+            )
+        except (OSError, ValueError, TypeError):
+            return False
+
+    for method in methods:
+        model = config["models"]["openwam"][method]
+        failures: list[tuple[str, str]] = []
+        pending = [task for task in tasks if not complete_task(method, task)]
+
+        def estimated_remaining(task: str) -> float:
+            task_root = run_root / "openwam" / method / "raw" / task
+            results = list(task_root.glob("state_*/result.json"))
+            if not results:
+                timing_reference = os.environ.get("OPENWAM_TASK_TIMING_REFERENCE")
+                if timing_reference:
+                    results = list((Path(timing_reference) / task).glob("state_*/result.json"))
+                if not results:
+                    return float("inf")
+            elapsed = [float(load_json(path)["rollouts"][0].get("elapsed_sec", 0))
+                       for path in results]
+            completed = len(list(task_root.glob("state_*/result.json")))
+            return (states_per_task - completed) * sum(elapsed) / len(elapsed)
+
+        pending.sort(key=estimated_remaining, reverse=True)
+        task_queues = {gpu: deque(pending[index::len(gpus)])
+                       for index, gpu in enumerate(gpus)}
+        for gpu in gpus:
+            print(f"[experiment1] GPU {gpu} pending tasks: {list(task_queues[gpu])}", flush=True)
+
+        def gpu_worker(gpu: int) -> list[tuple[str, str]]:
+            gpu_failures: list[tuple[str, str]] = []
+            worker_config = deepcopy(config)
+            port = (int(external_port_base) + gpu if external_port_base
+                    else choose_available_port(host, base_port, gpu))
+            worker_config["hardware"].update(
+                openwam_model_gpu=gpu, openwam_sim_gpu=gpu, openwam_port=port,
+            )
+            worker_dir = run_root / "openwam" / method / "workers" / f"gpu_{gpu}"
+            started = time.monotonic()
+            ready_start = time.monotonic()
+            if external_port_base:
+                from websockets.sync.client import connect
+
+                with connect(f"ws://{host}:{port}", open_timeout=10) as socket_client:
+                    socket_client.send(json.dumps({"type": "ping"}))
+                    reply = json.loads(socket_client.recv(timeout=10))
+                    if reply.get("type") != "pong":
+                        raise RuntimeError(f"Unexpected external server response on GPU {gpu}: {reply}")
+                process, log = None, None
+            else:
+                process, log = start_server(
+                    worker_config, method, model, run_root, dry_run, server_dir=worker_dir,
+                )
+            write_json(worker_dir / "timing.json", {
+                "gpu": gpu, "method": method, "ready_sec": round(time.monotonic() - ready_start, 3),
+            })
+            tasks_finished = 0
+
+            def client_loop(client_id: int) -> list[tuple[str, str]]:
+                nonlocal tasks_finished
+                errors: list[tuple[str, str]] = []
+                while True:
+                    with task_lock:
+                        if not task_queues[gpu]:
+                            return errors
+                        task = task_queues[gpu].popleft()
+                    if complete_task(method, task):
+                        print(f"[experiment1] reuse completed interleaved task: {task}", flush=True)
+                        continue
+                    task_root = run_root / "openwam" / method / "raw" / task
+                    client_env = make_env(worker_config, sim_gpu=True)
+                    client_env["ROBOTWIN_RUNTIME_ROOT"] = str(
+                        local_runtime_root(run_root, method, task, "interleaved")
+                    )
+                    command = probe_command(
+                        worker_config, operation="run_interleaved_task", task=task,
+                        result_file=task_root / "task_summary.json",
+                        progress_file=task_root / "progress.json",
+                        method=method, checkpoint_dir=model["checkpoint_dir"],
+                        num_states=states_per_task, max_action_steps=max_action_steps,
+                    )
+                    print(f"[experiment1] interleaved task {task} gpu={gpu} "
+                          f"client={client_id}", flush=True)
+                    try:
+                        run_logged(command, cwd=openwam_repo, env=client_env,
+                                   log_path=task_root / "driver.log", dry_run=dry_run, quiet=True)
+                        if not dry_run and not complete_task(method, task):
+                            raise RuntimeError("driver exited without 100 valid state results")
+                        tasks_finished += 1
+                    except Exception as exc:
+                        errors.append((task, str(exc)))
+                        print(f"[experiment1] failed interleaved task {task}: {exc}", flush=True)
+
+            try:
+                with ThreadPoolExecutor(max_workers=clients_per_gpu) as executor:
+                    futures = [executor.submit(client_loop, client_id)
+                               for client_id in range(clients_per_gpu)]
+                    for future in as_completed(futures):
+                        failures_for_client = future.result()
+                        gpu_failures.extend(failures_for_client)
+            finally:
+                stop_server(process, log)
+                write_json(worker_dir / "worker_timing.json", {
+                    "gpu": gpu, "method": method, "clients_per_gpu": clients_per_gpu,
+                    "tasks_finished": tasks_finished,
+                    "wall_sec": round(time.monotonic() - started, 3),
+                })
+            return gpu_failures
+
+        with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
+            futures = [executor.submit(gpu_worker, gpu) for gpu in gpus]
+            for future in as_completed(futures):
+                failures.extend(future.result())
+        if failures:
+            for task, error in failures:
+                print(f"[experiment1] failed {method}/{task}: {error}", flush=True)
+            raise RuntimeError(f"{len(failures)} interleaved task(s) failed; rerun to resume")
+
+
 def wilson_interval(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
     if n <= 0:
         return 0.0, 0.0
@@ -856,6 +1064,86 @@ def state_category(no_wm_successes: int, wm_successes: int, n: int) -> str:
     return "same_other"
 
 
+def summarize_single_model(run_root: Path, result_paths: list[Path]) -> None:
+    """Report the official-style success rate for one rollout per accepted state."""
+    metadata = load_json(run_root / "metadata.json")
+    expected_tasks = list(metadata["tasks"])
+    states_per_task = int(metadata["states_per_task"])
+    rollouts_per_state = int(metadata["rollouts_per_state"])
+    expected_count = len(expected_tasks) * states_per_task
+    interleaved = bool(load_json(run_root / "config.json")["protocol"].get("interleaved_expert_check"))
+    if rollouts_per_state != 1:
+        raise ValueError("Clean/Randomized SR requires exactly one rollout per initial state")
+    if len(result_paths) != expected_count:
+        raise ValueError(f"Incomplete evaluation: {len(result_paths)}/{expected_count} state results")
+
+    rows = []
+    modes = set()
+    methods = set()
+    for path in result_paths:
+        result = load_json(path)
+        if interleaved and result.get("expert_check") != {"plan_success": True, "check_success": True}:
+            raise ValueError(f"Missing expert feasibility check: {path}")
+        modes.add(result["mode"])
+        methods.add(result["method"])
+        rollouts = result.get("rollouts", [])
+        if (
+            int(result.get("num_rollouts", 0)) != 1
+            or int(result.get("valid_rollouts", 0)) != 1
+            or int(result.get("infra_failures", 0)) != 0
+            or len(rollouts) != 1
+            or rollouts[0].get("error")
+            or rollouts[0].get("truncated")
+        ):
+            raise ValueError(f"Invalid or truncated rollout: {path}")
+        rows.append({
+            "task": result["task"],
+            "state_id": int(result["state_id"]),
+            "accepted_seed": int(result["accepted_seed"]),
+            "policy_seed": int(rollouts[0]["policy_seed"]),
+            "success": int(bool(rollouts[0]["success"])),
+        })
+    if len(modes) != 1 or len(methods) != 1:
+        raise ValueError(f"Expected one mode and model, got modes={modes}, methods={methods}")
+    mode = next(iter(modes))
+    model_name = next(iter(methods))
+    metric = {"demo_clean": "Clean SR", "demo_randomized": "Randomized SR"}.get(mode)
+    if metric is None:
+        raise ValueError(f"Unsupported SR mode: {mode}")
+    for task in expected_tasks:
+        state_ids = [row["state_id"] for row in rows if row["task"] == task]
+        if sorted(state_ids) != list(range(states_per_task)):
+            raise ValueError(f"Missing or duplicate initial states for {task}: {state_ids}")
+
+    rows.sort(key=lambda row: (row["task"], row["state_id"]))
+    per_task = []
+    for task in expected_tasks:
+        successes = sum(row["success"] for row in rows if row["task"] == task)
+        per_task.append({"task": task, "successes": successes,
+                         "total": states_per_task, "sr": successes / states_per_task})
+    successes = sum(row["success"] for row in rows)
+    summary = {"metric": metric, "mode": mode, "tasks": len(expected_tasks),
+               "states_per_task": states_per_task, "successes": successes,
+               "total": len(rows), "sr": successes / len(rows)}
+    summary_dir = run_root / "summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in (("per_state.csv", rows), ("per_task.csv", per_task)):
+        with (summary_dir / name).open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(data[0]))
+            writer.writeheader()
+            writer.writerows(data)
+    write_json(summary_dir / "summary.json", summary)
+    lines = [f"# {metric}", "", f"Model: {model_name}",
+             f"Tasks: {len(expected_tasks)}", f"Initial states per task: {states_per_task}",
+             "Initial states were accepted only after expert plan_success and check_success().",
+             f"**{metric}: {100 * summary['sr']:.2f}% ({successes}/{len(rows)})**", "",
+             "| Task | Successes | Total | SR |", "|---|---:|---:|---:|"]
+    lines.extend(f"| {row['task']} | {row['successes']} | {row['total']} | {100 * row['sr']:.2f}% |"
+                 for row in per_task)
+    (summary_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[experiment1] {metric}: {100 * summary['sr']:.2f}% ({successes}/{len(rows)})", flush=True)
+
+
 def summarize(run_root: Path) -> None:
     result_paths = sorted(run_root.glob("*/*/raw/*/state_*/result.json"))
     if not result_paths:
@@ -869,6 +1157,10 @@ def summarize(run_root: Path) -> None:
         for rollout in load_json(path).get("rollouts", [])
     ):
         summarize_smoke(run_root, result_paths)
+        return
+
+    if len({load_json(path)["method"] for path in result_paths}) == 1:
+        summarize_single_model(run_root, result_paths)
         return
 
     per_method_state: dict[tuple[str, int, str], dict[str, Any]] = {}
@@ -1198,6 +1490,22 @@ def main() -> None:
     else:
         write_json(run_root / "config.json", config)
         write_json(run_root / "metadata.json", metadata)
+
+    if config["protocol"].get("interleaved_expert_check"):
+        if args.command != "run" or partial or args.force_manifests:
+            parser.error("interleaved expert check supports only a full run, without manifests")
+        methods = list(config["models"]["openwam"]) if args.method == "all" else [args.method]
+        if not args.skip_text_cache:
+            prepare_text_cache(config, run_root, tasks=tasks, methods=methods, dry_run=args.dry_run)
+        run_interleaved_methods(
+            config, run_root, tasks=tasks, methods=methods,
+            states_per_task=states_per_task,
+            max_action_steps=args.max_action_steps, dry_run=args.dry_run,
+        )
+        if not args.dry_run:
+            summarize(run_root)
+        print(f"[experiment1] run directory: {run_root}", flush=True)
+        return
 
     ensure_manifests(
         config,

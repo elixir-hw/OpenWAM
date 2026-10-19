@@ -18,10 +18,12 @@ from benchmarks.utils.client import server_error_from_body
 # needs to import the torch-heavy openwam package.
 # Client -> server
 OBS = "obs"
+OBS_CHUNK = "obs_chunk"
 RESET = "reset"
 PING = "ping"
 # Server -> client
 ACTION = "action"
+ACTION_CHUNK = "action_chunk"
 RESET_ACK = "reset_ack"
 PONG = "pong"
 ERROR = "error"
@@ -125,6 +127,10 @@ class WSPolicyClient:
 
     def predict(self, payload: dict) -> dict:
         return self._roundtrip({**payload, "type": OBS})
+
+    def predict_chunk(self, payload: dict) -> dict:
+        # A lost response must not silently replay an inference request.
+        return self._roundtrip({**payload, "type": OBS_CHUNK}, reconnect=False)
 
     def predict_once(self, payload: dict) -> dict:
         """Send one observation without retrying an ambiguous action request."""

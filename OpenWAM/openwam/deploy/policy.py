@@ -61,6 +61,16 @@ class WAMPolicy:
         downstream command contract for the WS server and direct consumers.
         """
         action = self._executor.predict_action(self._build_conditions(obs))
+        return self._project_action(action)
+
+    def predict_action_chunk(self, obs: dict) -> np.ndarray:
+        """Export one sync execution horizon without changing its actions."""
+        if self._async:
+            raise ValueError("Chunk transfer requires synchronous inference mode")
+        actions = self._executor.predict_action_chunk(self._build_conditions(obs))
+        return np.stack([self._project_action(action) for action in actions])
+
+    def _project_action(self, action: np.ndarray) -> np.ndarray:
         dims = getattr(getattr(self.engine, "architecture", None), "binary_command_dims", ()) or ()
         if dims:
             action = np.array(action)

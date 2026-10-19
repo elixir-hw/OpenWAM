@@ -32,6 +32,8 @@ Server-side behavior:
 
 Messages:
     obs   → {"type": "action", "action": [floats], "step": int, "latency_ms": float}
+    obs_chunk → {"type": "action_chunk", "actions": [[floats], ...], "step": int,
+                 "latency_ms": float} (synchronous executor only)
     reset → {"type": "reset_ack"}
     ping  → {"type": "pong"}
     error → {"type": "error", "code": str, "message": "<what went wrong>"}
@@ -58,10 +60,12 @@ logger = logging.getLogger(__name__)
 # these string values are a frozen wire contract and must never change.
 # Client -> server
 OBS = "obs"
+OBS_CHUNK = "obs_chunk"
 RESET = "reset"
 PING = "ping"
 # Server -> client
 ACTION = "action"
+ACTION_CHUNK = "action_chunk"
 RESET_ACK = "reset_ack"
 PONG = "pong"
 ERROR = "error"
@@ -248,6 +252,26 @@ class PolicyServer:
             "latency_ms": round(latency_ms, 2),
         }
 
+    def predict_chunk(self, obs: dict, *, session: Optional[PolicySession] = None) -> dict:
+        """Return the sync executor's next action horizon in one round trip."""
+        self._init_policy()
+        if session is not None and not session.initialized:
+            raise ValueError("A new session must reset before its first observation")
+        t0 = time.monotonic()
+        processed = self._obs_preprocessor.preprocess(obs)
+        actions = (session.policy if session is not None else self._policy).predict_action_chunk(processed)
+        latency_ms = (time.monotonic() - t0) * 1000
+        count = len(actions)
+        if session is None:
+            self._request_count += count
+            self._total_latency += latency_ms
+            step = self._request_count
+        else:
+            session.request_count += count
+            session.total_latency += latency_ms
+            step = session.request_count
+        return {"actions": actions.tolist(), "step": step, "latency_ms": round(latency_ms, 2)}
+
     def reset(self):
         """Reset policy state."""
         if self._policy is not None:
@@ -293,6 +317,10 @@ class PolicyServer:
                         elif msg_type == OBS:
                             result = self.predict(data, session=session)
                             result["type"] = ACTION
+                            await websocket.send(json.dumps(result))
+                        elif msg_type == OBS_CHUNK:
+                            result = self.predict_chunk(data, session=session)
+                            result["type"] = ACTION_CHUNK
                             await websocket.send(json.dumps(result))
                         elif msg_type == PING:
                             await websocket.send(json.dumps({"type": PONG, **self._ckpt_contract()}))

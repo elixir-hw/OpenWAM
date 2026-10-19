@@ -48,6 +48,14 @@ class SyncInferenceExecutor:
         action = self._action_buffer.popleft()
         return action
 
+    def predict_action_chunk(self, conditions: dict) -> np.ndarray:
+        """Return the same queued actions that per-step calls would consume."""
+        if len(self._action_buffer) == 0:
+            self._generate_and_enqueue(conditions)
+        actions = np.stack(tuple(self._action_buffer))
+        self._action_buffer.clear()
+        return actions
+
     def _generate_and_enqueue(self, conditions: dict):
         """Run inference and keep only the executable action horizon."""
         result = self.engine.generate(conditions)

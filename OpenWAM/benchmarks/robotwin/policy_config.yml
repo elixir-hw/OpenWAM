@@ -35,4 +35,5 @@ action_type: ee
 # action_indices: null    # optional index reordering of the returned action vector
 
 debug: false
+use_action_chunk: true     # request one action horizon, then use the local buffer
 debug_dir: "./debug_images"  # where to save the raw per-camera PNGs + meta.json

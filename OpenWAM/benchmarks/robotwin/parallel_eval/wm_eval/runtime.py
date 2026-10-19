@@ -98,7 +98,9 @@ def run_logged(
     if dry_run:
         log_path.write_text(rendered + "\n", encoding="utf-8")
         return
-    with log_path.open("w", encoding="utf-8") as log:
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"\n[wm-eval] command={rendered}\n")
+        log.flush()
         process = subprocess.Popen(
             command,
             cwd=str(cwd),

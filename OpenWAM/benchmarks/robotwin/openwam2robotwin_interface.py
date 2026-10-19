@@ -43,6 +43,7 @@ if _PROJECT_ROOT not in _sys.path:
 import json  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
+from collections import deque  # noqa: E402
 from typing import Dict, Optional  # noqa: E402
 
 import cv2 as cv  # noqa: E402
@@ -154,9 +155,8 @@ def _apply_step_lim_override(task_env) -> None:
 class ModelClient:
     """RoboTwin ``ModelClient`` backed by the OpenWAM Policy Server.
 
-    The server manages action chunking internally, so this client sends an obs
-    message every step and lets the server decide whether to run full diffusion
-    inference or pop a cached action from its buffer.
+    Chunk mode requests one execution horizon at each replan and keeps the
+    remaining actions locally. The legacy per-step protocol remains available.
     """
 
     def __init__(
@@ -170,6 +170,7 @@ class ModelClient:
         action_type: str = "qpos",
         debug: bool = False,
         debug_dir: str = "./debug_images",
+        use_action_chunk: bool = False,
     ) -> None:
         """
         Args:
@@ -207,6 +208,10 @@ class ModelClient:
         self._task_description = ""
         self._debug = debug
         self._debug_dir = debug_dir
+        self._use_action_chunk = bool(use_action_chunk)
+        if self._use_action_chunk and self._debug:
+            raise ValueError("Per-step debug images require the legacy observation protocol")
+        self._pending_actions = deque()
         self._episode = -1  # incremented to 0 on the first reset_model() call
         self._step = 0
         self._sampling_seed: Optional[int] = None
@@ -218,7 +223,8 @@ class ModelClient:
             f"[OpenWAMClient] server={self._ws_url} send_state={send_state} "
             f"state_dim={state_dim} "
             f"request_timeout={request_timeout}s action_type={action_type} "
-            f"action_indices={action_indices} debug={debug} debug_dir={debug_dir}"
+            f"action_indices={action_indices} debug={debug} debug_dir={debug_dir} "
+            f"use_action_chunk={self._use_action_chunk}"
         )
 
         self._wait_until_healthy()
@@ -255,6 +261,7 @@ class ModelClient:
                 os.makedirs(ep_dir, exist_ok=True)
                 print(f"[OpenWAMClient] debug images → {ep_dir}")
         self._task_description = task_description
+        self._pending_actions.clear()
         result = self._client.reset()
         if result.get("type") != transport.RESET_ACK:
             raise RuntimeError(f"[OpenWAMClient] Server reset failed: {result}")
@@ -262,6 +269,9 @@ class ModelClient:
     def set_sampling_seed(self, seed: int) -> None:
         self._sampling_seed = int(seed)
         self._step = 0
+
+    def should_request_observation(self) -> bool:
+        return not self._use_action_chunk or not self._pending_actions
 
     def _save_debug_step(
         self,
@@ -301,7 +311,7 @@ class ModelClient:
         with open(os.path.join(step_dir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-    def step(self, example: dict) -> np.ndarray:
+    def step(self, example: Optional[dict]) -> np.ndarray:
         """
         Submit one observation to the server and return the next action.
 
@@ -319,6 +329,12 @@ class ModelClient:
         Returns:
             action: np.ndarray, shape (action_dim,)
         """
+        if self._use_action_chunk and self._pending_actions:
+            action = self._pending_actions.popleft()
+            self._step += 1
+            return action[self._action_indices] if self._action_indices is not None else action
+        if example is None:
+            raise ValueError("Observation required when the action chunk is empty")
         cams = example["cams"]
         instruction = str(example.get("lang", self._task_description))
 
@@ -355,8 +371,18 @@ class ModelClient:
         )
         if self._sampling_seed is not None:
             payload["seed"] = self._sampling_seed * 10000 + self._step
-        response = self._client.predict(payload)
-        action = np.array(response["action"], dtype=np.float32)
+        if self._use_action_chunk:
+            response = self._client.predict_chunk(payload)
+            if response.get("type") != transport.ACTION_CHUNK:
+                raise RuntimeError(f"Server did not return an action chunk: {response}")
+            actions = np.asarray(response["actions"], dtype=np.float32)
+            if actions.ndim != 2 or actions.shape[0] < 1:
+                raise ValueError(f"Invalid action chunk shape: {actions.shape}")
+            self._pending_actions.extend(actions)
+            action = self._pending_actions.popleft()
+        else:
+            response = self._client.predict(payload)
+            action = np.array(response["action"], dtype=np.float32)
 
         self._step += 1
         if self._debug:
@@ -384,6 +410,7 @@ def get_model(usr_args: dict) -> ModelClient:
         action_type=usr_args.get("action_type", "qpos"),
         debug=_parse_bool(usr_args.get("debug", False), default=False),
         debug_dir=usr_args.get("debug_dir", "./debug_images"),
+        use_action_chunk=_parse_bool(usr_args.get("use_action_chunk", False), default=False),
     )
 
 
@@ -423,7 +450,7 @@ def _extract_proprio(model: ModelClient, observation: dict) -> np.ndarray:
         ) from exc
 
 
-def eval(TASK_ENV, model: ModelClient, observation: dict) -> None:
+def eval(TASK_ENV, model: ModelClient, observation: Optional[dict]) -> None:
     """Per-step callback invoked by RoboTwin's eval_policy.py.
 
     RoboTwin exposes three per-camera entries under ``observation["observation"]``
@@ -432,6 +459,18 @@ def eval(TASK_ENV, model: ModelClient, observation: dict) -> None:
     ``front_camera`` is ignored — it's not part of the server contract.
     """
     _apply_step_lim_override(TASK_ENV)
+
+    if observation is None and str(TASK_ENV.get_instruction()) != model._task_description:
+        # Instructions are fixed in the 50-task protocol, but a live caller may
+        # change one mid-horizon. Replan from a fresh image in that case.
+        observation = TASK_ENV.get_obs()
+
+    if observation is None:
+        action = model.step(None)
+        if model._action_type == "ee" and len(action) == 20:
+            action = action_conversion.eef20d_to_ee16d(action)
+        TASK_ENV.take_action(action, action_type=model._action_type)
+        return
 
     instruction = TASK_ENV.get_instruction()
     obs = observation["observation"]
